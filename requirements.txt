@@ -1,0 +1,9 @@
+diffusers @ git+https://github.com/huggingface/diffusers
+torch
+transformers
+accelerate
+sentencepiece
+bitsandbytes
+opencv-python
+gradio
+moviepy==1.0.3
