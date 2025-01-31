@@ -146,10 +146,41 @@ def extract_last_frame(video_path):
         print(f"Error extracting last frame: {str(e)}")
         raise
 
+def resize_video(video_path, target_resolution):
+    """
+    Resize a video to match the target resolution
+    Returns path to the resized video
+    """
+    width, height = map(int, target_resolution.split('x'))
+    
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+            video = mp.VideoFileClip(video_path)
+            resized_video = video.resize(width=width, height=height)
+            resized_video.write_videofile(tmp_file.name, codec="libx264")
+            video.close()
+            resized_video.close()
+            return tmp_file.name
+    except Exception as e:
+        print(f"Error resizing video: {str(e)}")
+        raise
+
 def extend_video(video_path, prompt, num_inference_steps, guidance_scale, num_frames, resolution):
     print(f"Starting video extension with params: {resolution}, {num_frames} frames")
     
     try:
+        # First, resize the input video if needed
+        print("Checking and resizing input video...")
+        cap = cv2.VideoCapture(video_path)
+        input_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        input_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        
+        target_width, target_height = map(int, resolution.split('x'))
+        if input_width != target_width or input_height != target_height:
+            print(f"Resizing video from {input_width}x{input_height} to {resolution}")
+            video_path = resize_video(video_path, resolution)
+        
         print("Extracting last frame from video...")
         last_frame = extract_last_frame(video_path)
         
@@ -171,8 +202,12 @@ def extend_video(video_path, prompt, num_inference_steps, guidance_scale, num_fr
             # Clean up temporary files
             video1.close()
             video2.close()
+            final_video.close()
             if os.path.exists(extension_path):
                 os.unlink(extension_path)
+            # Clean up resized video if it was created
+            if input_width != target_width or input_height != target_height:
+                os.unlink(video_path)
                 
             return tmp_file.name
             
