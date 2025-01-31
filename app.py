@@ -1,9 +1,8 @@
 import gradio as gr
 import torch
-from diffusers import BitsAndBytesConfig as DiffusersBitsAndBytesConfig
-from diffusers import LTXPipeline, LTXImageToVideoPipeline, LTXVideoTransformer3DModel
+from diffusers import LTXPipeline, LTXImageToVideoPipeline
+from transformers import BitsAndBytesConfig
 from diffusers.utils import export_to_video
-from transformers import BitsAndBytesConfig, T5EncoderModel
 import tempfile
 import os
 import cv2
@@ -15,41 +14,28 @@ import moviepy.editor as mp
 print("Initializing pipelines...")
 
 def init_pipelines():
-    print("Loading text encoder...")
-    quant_config = BitsAndBytesConfig(load_in_8bit=True)
-    text_encoder_8bit = T5EncoderModel.from_pretrained(
-        "Lightricks/LTX-Video",
-        subfolder="text_encoder",
-        quantization_config=quant_config,
-        torch_dtype=torch.float16,
+    print("Setting up quantization configs...")
+    # Using the recommended quantization settings from the docs
+    quant_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        device_map={"": torch.device("cuda:0")}
     )
-
-    print("Loading transformer...")
-    quant_config = DiffusersBitsAndBytesConfig(load_in_8bit=True)
-    transformer_8bit = LTXVideoTransformer3DModel.from_pretrained(
-        "Lightricks/LTX-Video",
-        subfolder="transformer",
-        quantization_config=quant_config,
-        torch_dtype=torch.float16,
-    )
-
+    
     print("Creating text-to-video pipeline...")
     text_pipeline = LTXPipeline.from_pretrained(
         "Lightricks/LTX-Video",
-        text_encoder=text_encoder_8bit,
-        transformer=transformer_8bit,
-        torch_dtype=torch.float16,
-        device_map="balanced",
+        torch_dtype=torch.float16,  # Changed to float16 for compatibility with 8-bit quantization
+        quantization_config=quant_config
     )
-
+    text_pipeline.enable_model_cpu_offload()
+    
     print("Creating image-to-video pipeline...")
     image_pipeline = LTXImageToVideoPipeline.from_pretrained(
         "Lightricks/LTX-Video",
-        text_encoder=text_encoder_8bit,
-        transformer=transformer_8bit,
-        torch_dtype=torch.float16,
-        device_map="balanced",
+        torch_dtype=torch.float16,  # Changed to float16 for compatibility with 8-bit quantization
+        quantization_config=quant_config
     )
+    image_pipeline.enable_model_cpu_offload()
     
     return text_pipeline, image_pipeline
 
@@ -64,15 +50,16 @@ def generate_video_from_text(prompt, num_inference_steps, guidance_scale, num_fr
     
     try:
         print("Generating video frames...")
-        output = TEXT_PIPELINE(
-            prompt=prompt,
-            negative_prompt="worst quality, low quality, blurry, distorted",
-            num_frames=num_frames,
-            num_inference_steps=num_inference_steps,
-            height=height,
-            width=width,
-            guidance_scale=guidance_scale,
-        )
+        with torch.inference_mode():  # Added for better memory efficiency
+            output = TEXT_PIPELINE(
+                prompt=prompt,
+                negative_prompt="worst quality, low quality, blurry, distorted",
+                num_frames=num_frames,
+                num_inference_steps=num_inference_steps,
+                height=height,
+                width=width,
+                guidance_scale=guidance_scale,
+            )
         
         print("Exporting to video file...")
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
@@ -85,43 +72,10 @@ def generate_video_from_text(prompt, num_inference_steps, guidance_scale, num_fr
         import traceback
         traceback.print_exc()
         return f"Error: {str(e)}"
-
-def generate_video_from_image(image, prompt, num_inference_steps, guidance_scale, num_frames, resolution):
-    print(f"Starting image-to-video generation with params: {resolution}, {num_frames} frames")
-    width, height = resolution.split('x')
-    width, height = int(width), int(height)
-    
-    try:
-        print("Processing input image...")
-        if isinstance(image, np.ndarray):
-            image = Image.fromarray(image)
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        image = image.resize((width, height))
-        
-        print("Generating video frames...")
-        output = IMAGE_PIPELINE(
-            image=image,
-            prompt=prompt,
-            negative_prompt="worst quality, low quality, blurry, distorted",
-            num_frames=num_frames,
-            num_inference_steps=num_inference_steps,
-            height=height,
-            width=width,
-            guidance_scale=guidance_scale,
-        )
-        
-        print("Exporting to video file...")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
-            export_to_video(output.frames[0], tmp_file.name, fps=24)
-            print(f"Video saved to {tmp_file.name}")
-            return tmp_file.name
-            
-    except Exception as e:
-        print(f"Error in image-to-video generation: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return f"Error: {str(e)}"
+    finally:
+        # Force CUDA cache cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 def extract_last_frame(video_path):
     try:
@@ -146,76 +100,52 @@ def extract_last_frame(video_path):
         print(f"Error extracting last frame: {str(e)}")
         raise
 
-def resize_video(video_path, target_resolution):
-    """
-    Resize a video to match the target resolution
-    Returns path to the resized video
-    """
-    width, height = map(int, target_resolution.split('x'))
+def generate_video_from_source(source, prompt, num_inference_steps, guidance_scale, num_frames, resolution):
+    print(f"Starting source-to-video generation with params: {resolution}, {num_frames} frames")
+    width, height = resolution.split('x')
+    width, height = int(width), int(height)
     
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
-            video = mp.VideoFileClip(video_path)
-            resized_video = video.resize(width=width, height=height)
-            resized_video.write_videofile(tmp_file.name, codec="libx264")
-            video.close()
-            resized_video.close()
-            return tmp_file.name
-    except Exception as e:
-        print(f"Error resizing video: {str(e)}")
-        raise
-
-def extend_video(video_path, prompt, num_inference_steps, guidance_scale, num_frames, resolution):
-    print(f"Starting video extension with params: {resolution}, {num_frames} frames")
-    
-    try:
-        # First, resize the input video if needed
-        print("Checking and resizing input video...")
-        cap = cv2.VideoCapture(video_path)
-        input_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        input_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
-        
-        target_width, target_height = map(int, resolution.split('x'))
-        if input_width != target_width or input_height != target_height:
-            print(f"Resizing video from {input_width}x{input_height} to {resolution}")
-            video_path = resize_video(video_path, resolution)
-        
-        print("Extracting last frame from video...")
-        last_frame = extract_last_frame(video_path)
-        
-        print("Generating extension from last frame...")
-        extension_path = generate_video_from_image(
-            last_frame, prompt, num_inference_steps, guidance_scale, num_frames, resolution
-        )
-        
-        if extension_path.startswith("Error"):
-            return extension_path
+        print("Processing input source...")
+        if isinstance(source, str) and os.path.exists(source):  # Video input
+            image = extract_last_frame(source)
+        elif isinstance(source, np.ndarray):  # Image input as numpy array
+            image = Image.fromarray(source)
+        else:  # Direct PIL Image input
+            image = source
             
-        print("Concatenating videos...")
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        image = image.resize((width, height))
+        
+        print("Generating video frames...")
+        with torch.inference_mode():  # Added for better memory efficiency
+            output = IMAGE_PIPELINE(
+                image=image,
+                prompt=prompt,
+                negative_prompt="worst quality, low quality, blurry, distorted",
+                num_frames=num_frames,
+                num_inference_steps=num_inference_steps,
+                height=height,
+                width=width,
+                guidance_scale=guidance_scale,
+            )
+        
+        print("Exporting to video file...")
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
-            video1 = mp.VideoFileClip(video_path)
-            video2 = mp.VideoFileClip(extension_path)
-            final_video = mp.concatenate_videoclips([video1, video2])
-            final_video.write_videofile(tmp_file.name, codec="libx264")
-            
-            # Clean up temporary files
-            video1.close()
-            video2.close()
-            final_video.close()
-            if os.path.exists(extension_path):
-                os.unlink(extension_path)
-            # Clean up resized video if it was created
-            if input_width != target_width or input_height != target_height:
-                os.unlink(video_path)
-                
+            export_to_video(output.frames[0], tmp_file.name, fps=24)
+            print(f"Video saved to {tmp_file.name}")
             return tmp_file.name
             
     except Exception as e:
-        print(f"Error extending video: {str(e)}")
+        print(f"Error in source-to-video generation: {str(e)}")
         import traceback
         traceback.print_exc()
         return f"Error: {str(e)}"
+    finally:
+        # Force CUDA cache cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 # Gradio interface
 with gr.Blocks() as demo:
@@ -224,7 +154,8 @@ with gr.Blocks() as demo:
     with gr.Tab("Text to Video"):
         text_input = gr.Textbox(
             label="Enter your prompt",
-            placeholder="A detailed description of the video you want to generate..."
+            placeholder="A detailed description of the video you want to generate...",
+            lines=3
         )
         
         with gr.Row():
@@ -271,29 +202,33 @@ with gr.Blocks() as demo:
             outputs=text_output
         )
     
-    with gr.Tab("Image to Video"):
-        image_input = gr.Image(type="pil", label="Upload an image")
-        image_text_input = gr.Textbox(
+    with gr.Tab("Image/Video to Video"):
+        with gr.Row():
+            image_input = gr.Image(type="pil", label="Upload an image")
+            video_input = gr.Video(label="Or upload a video (last frame will be used)")
+        
+        source_text_input = gr.Textbox(
             label="Enter your prompt",
-            placeholder="Describe how you want the image to animate..."
+            placeholder="Describe how you want the image/video to animate...",
+            lines=3
         )
         
         with gr.Row():
-            image_num_inference_steps = gr.Slider(
+            source_num_inference_steps = gr.Slider(
                 minimum=1,
                 maximum=50,
                 value=30,
                 step=1,
                 label="Num Inference Steps"
             )
-            image_guidance_scale = gr.Slider(
+            source_guidance_scale = gr.Slider(
                 minimum=1.0,
                 maximum=20.0,
                 value=7.5,
                 step=0.1,
                 label="Guidance Scale"
             )
-            image_num_frames = gr.Slider(
+            source_num_frames = gr.Slider(
                 minimum=16,
                 maximum=128,
                 value=64,
@@ -301,187 +236,36 @@ with gr.Blocks() as demo:
                 label="Number of Frames"
             )
             
-        image_resolution = gr.Radio(
+        source_resolution = gr.Radio(
             ["576x320", "768x432", "1024x576"],
             label="Resolution (width x height)",
             value="576x320"
         )
         
-        image_generate_button = gr.Button("Generate Video")
-        image_output = gr.Video(label="Generated Video")
+        source_generate_button = gr.Button("Generate Video")
+        source_output = gr.Video(label="Generated Video")
         
-        image_generate_button.click(
-            generate_video_from_image,
+        def handle_source_input(image, video, prompt, steps, guidance, frames, resolution):
+            source = video if video is not None else image
+            if source is None:
+                return "Error: Please provide either an image or video input"
+            return generate_video_from_source(source, prompt, steps, guidance, frames, resolution)
+        
+        source_generate_button.click(
+            handle_source_input,
             inputs=[
                 image_input,
-                image_text_input,
-                image_num_inference_steps,
-                image_guidance_scale,
-                image_num_frames,
-                image_resolution
+                video_input,
+                source_text_input,
+                source_num_inference_steps,
+                source_guidance_scale,
+                source_num_frames,
+                source_resolution
             ],
-            outputs=image_output
-        )
-    
-    with gr.Tab("Extend Video"):
-        extend_video_input = gr.Video(label="Upload a video to extend")
-        extend_text_input = gr.Textbox(
-            label="Enter your prompt for the extension",
-            placeholder="Describe how you want the video to continue..."
-        )
-        
-        with gr.Row():
-            extend_num_inference_steps = gr.Slider(
-                minimum=1,
-                maximum=50,
-                value=30,
-                step=1,
-                label="Num Inference Steps"
-            )
-            extend_guidance_scale = gr.Slider(
-                minimum=1.0,
-                maximum=20.0,
-                value=7.5,
-                step=0.1,
-                label="Guidance Scale"
-            )
-            extend_num_frames = gr.Slider(
-                minimum=16,
-                maximum=128,
-                value=64,
-                step=16,
-                label="Number of Frames"
-            )
-            
-        extend_resolution = gr.Radio(
-            ["576x320", "768x432", "1024x576"],
-            label="Resolution (width x height)",
-            value="576x320"
-        )
-        
-        extend_button = gr.Button("Extend Video")
-        extend_output = gr.Video(label="Extended Video")
-        
-        extend_button.click(
-            extend_video,
-            inputs=[
-                extend_video_input,
-                extend_text_input,
-                extend_num_inference_steps,
-                extend_guidance_scale,
-                extend_num_frames,
-                extend_resolution
-            ],
-            outputs=extend_output
+            outputs=source_output
         )
 
 if __name__ == "__main__":
     # Launch with a larger queue size for video generation
     demo.queue(max_size=5)
-    demo.launch()
-    gr.Markdown("# LTX Video Generation")
-    
-    with gr.Tab("Text to Video"):
-        text_input = gr.Textbox(
-            label="Enter your prompt",
-            placeholder="A detailed description of the video you want to generate..."
-        )
-        
-        with gr.Row():
-            text_num_inference_steps = gr.Slider(
-                minimum=1,
-                maximum=50,
-                value=30,
-                step=1,
-                label="Num Inference Steps"
-            )
-            text_guidance_scale = gr.Slider(
-                minimum=1.0,
-                maximum=20.0,
-                value=7.5,
-                step=0.1,
-                label="Guidance Scale"
-            )
-            text_num_frames = gr.Slider(
-                minimum=16,
-                maximum=128,
-                value=64,
-                step=16,
-                label="Number of Frames"
-            )
-            
-        text_resolution = gr.Radio(
-            ["576x320", "768x432", "1024x576"],
-            label="Resolution (width x height)",
-            value="576x320"
-        )
-        
-        text_generate_button = gr.Button("Generate Video")
-        text_output = gr.Video(label="Generated Video")
-        
-        text_generate_button.click(
-            generate_video_from_text,
-            inputs=[
-                text_input,
-                text_num_inference_steps,
-                text_guidance_scale,
-                text_num_frames,
-                text_resolution
-            ],
-            outputs=text_output
-        )
-    
-    with gr.Tab("Image to Video"):
-        image_input = gr.Image(type="pil", label="Upload an image")
-        image_text_input = gr.Textbox(
-            label="Enter your prompt",
-            placeholder="Describe how you want the image to animate..."
-        )
-        
-        with gr.Row():
-            image_num_inference_steps = gr.Slider(
-                minimum=1,
-                maximum=50,
-                value=30,
-                step=1,
-                label="Num Inference Steps"
-            )
-            image_guidance_scale = gr.Slider(
-                minimum=1.0,
-                maximum=20.0,
-                value=7.5,
-                step=0.1,
-                label="Guidance Scale"
-            )
-            image_num_frames = gr.Slider(
-                minimum=16,
-                maximum=128,
-                value=64,
-                step=16,
-                label="Number of Frames"
-            )
-            
-        image_resolution = gr.Radio(
-            ["576x320", "768x432", "1024x576"],
-            label="Resolution (width x height)",
-            value="576x320"
-        )
-        
-        image_generate_button = gr.Button("Generate Video")
-        image_output = gr.Video(label="Generated Video")
-        
-        image_generate_button.click(
-            generate_video_from_image,
-            inputs=[
-                image_input,
-                image_text_input,
-                image_num_inference_steps,
-                image_guidance_scale,
-                image_num_frames,
-                image_resolution
-            ],
-            outputs=image_output
-        )
-
-if __name__ == "__main__":
     demo.launch()
